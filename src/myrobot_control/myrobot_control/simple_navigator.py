@@ -5,7 +5,7 @@ Simple Navigator — Stage 3: single waypoint ALIGN + DRIVE.
 States:
   NEED_POSE → wait until /odometry/filtered has produced a pose
   ALIGN     → rotate to face the bearing of (wp_x, wp_y)
-  DRIVE     → drive toward the point with trapezoid profiler + heading PID
+    DRIVE     → drive toward the point with acceleration-limited speed + heading PID
   ORIENT    → (optional) spin to final yaw wp_yaw once arrived
   DONE      → stopped, mission complete
 
@@ -15,9 +15,9 @@ ALIGN/ORIENT use `steer_pid()` (PID on heading, damped from odom yaw rate,
 anti-windup integral, ramped min velocity near tolerance for stall). Settled
 requires small error AND small rate.
 
-DRIVE: bearing re-computed each tick toward the point; v comes from the
-symmetric trapezoid profiler (accel ~ travelled, decel ~ to_go, cruise at
-v_max), heading held by the PID. If heading error exceeds `realign_threshold`
+DRIVE: bearing re-computed each tick toward the point; v comes from an
+acceleration-limited profile that brakes according to remaining distance,
+heading held by the PID. If heading error exceeds `realign_threshold`
 the FSM re-enters ALIGN. Settled: to_go < pos_tol AND |lin_vel| < lin_thresh,
 then optional ORIENT, else DONE.
 
@@ -80,8 +80,10 @@ class Navigator(Node):
         self.declare_parameter("realign_threshold", 0.35)  # rad, re-ALIGN while driving
 
         # ── safety params ────────────────────────────────────────────────
-        self.declare_parameter("odom_timeout", 0.5)     # s
-        self.declare_parameter("max_state_time", 10.0)  # s, stuck protection
+        self.declare_parameter("odom_timeout", 1.0)     # s
+        self.declare_parameter("max_state_time", 10.0)  # s, rotate-state timeout
+        self.declare_parameter("progress_timeout", 10.0)  # s without drive progress
+        self.declare_parameter("progress_epsilon", 0.01)  # m required progress
         self.declare_parameter("rate_hz", 20.0)
 
         self.wp_x_ = float(self.get_parameter("wp_x").value)
@@ -109,6 +111,8 @@ class Navigator(Node):
 
         self.odom_timeout_ = float(self.get_parameter("odom_timeout").value)
         self.max_state_time_ = float(self.get_parameter("max_state_time").value)
+        self.progress_timeout_ = float(self.get_parameter("progress_timeout").value)
+        self.progress_epsilon_ = float(self.get_parameter("progress_epsilon").value)
         self.rate_hz_ = float(self.get_parameter("rate_hz").value)
         self.dt_ = 1.0 / self.rate_hz_
 
@@ -131,8 +135,9 @@ class Navigator(Node):
         self._last_odom_time = self.get_clock().now()
 
         # drive bookkeeping
-        self._start_x = 0.0
-        self._start_y = 0.0
+        self._profile_speed_ = 0.0
+        self._last_drive_distance_ = 0.0
+        self._last_progress_time = self.get_clock().now()
 
         # integral accumulators (per control phase, reset on entry)
         self._rot_state = _IntegralState()
@@ -182,7 +187,8 @@ class Navigator(Node):
             self._state = _State.DONE
             return
 
-        if (now - self._state_entry).nanoseconds / 1e9 > self.max_state_time_:
+        if (self._state is not _State.DRIVE
+            and (now - self._state_entry).nanoseconds / 1e9 > self.max_state_time_):
             self.get_logger().error(
                 f"State {self._state.name} timed out after {self.max_state_time_}s. Aborting.")
             self._stop()
@@ -208,8 +214,10 @@ class Navigator(Node):
     def _enter_drive(self, now):
         self._state = _State.DRIVE
         self._state_entry = now
-        self._start_x, self._start_y = self.x, self.y
         self._drv_state.reset()
+        self._profile_speed_ = 0.0
+        self._last_drive_distance_ = self._to_go()
+        self._last_progress_time = now
         self.get_logger().info(
             f"→ DRIVE, to_go={self._to_go():.2f} m.")
 
@@ -264,40 +272,46 @@ class Navigator(Node):
                            (self.kp_drv_, self.ki_drv_, self.kd_drv_),
                            self._drv_state, use_floor=False)
 
-        # progress along the start→goal axis (>= 0), keeps the accel curve
-        # honest even if the path arcs sideways
-        tot_x = self.wp_x_ - self._start_x
-        tot_y = self.wp_y_ - self._start_y
-        leg = math.hypot(tot_x, tot_y)
-        progress = self._clamp(
-            ((self.x - self._start_x) * tot_x + (self.y - self._start_y) * tot_y) / max(leg, 1e-9),
-            leg)
-        progress = max(progress, 0.0)
+        v = self._profile(to_go)
 
-        v = self._profile(to_go, progress)
+        now = self.get_clock().now()
+        if to_go < self._last_drive_distance_ - self.progress_epsilon_:
+            self._last_drive_distance_ = to_go
+            self._last_progress_time = now
+        elif (
+            to_go > self.pos_tol_
+            and self._profile_speed_ > self.lin_thresh_
+            and (now - self._last_progress_time).nanoseconds / 1e9 > self.progress_timeout_
+        ):
+            self.get_logger().error(
+                f"No drive progress for {self.progress_timeout_:.1f}s. Aborting.")
+            self._stop()
+            self._state = _State.DONE
+            return
 
         settled = to_go < self.pos_tol_ and abs(self.lin_vel) < self.lin_thresh_
         if settled:
             self.get_logger().info(
                 f"Arrived: to_go={to_go:.3f} m, speed={self.lin_vel:.3f} m/s. "
-                f"Progress={progress:.3f} m.")
+                f"Yaw={math.degrees(self.yaw):.1f}°.")
             self._stop()
             self._enter_orient(self.get_clock().now())
             return
 
         self._publish_cmd(v, w)
 
-    def _profile(self, to_go: float, travelled: float) -> float:
-        """Symmetric trapezoid velocity profile.
+    def _profile(self, to_go: float) -> float:
+        """Ramp the command toward a speed that can brake before the goal."""
+        braking_speed = math.sqrt(self._two_a_ * max(to_go, 0.0))
+        target_speed = min(self.v_max_, braking_speed)
+        step = self.a_max_ * self.dt_
 
-        v = min(v_max, sqrt(2·a·travelled), sqrt(2·a·to_go))
-        Accel curve ~ travelled (progress), decel curve ~ to_go. They meet at
-        mid-leg → cruise at v_max. Short legs → triangle (no cruise).
-        """
-        a = self._two_a_
-        v_accel = math.sqrt(a * max(travelled, 0.0))
-        v_brake = math.sqrt(a * max(to_go, 0.0))
-        return min(self.v_max_, v_accel, v_brake)
+        if target_speed > self._profile_speed_:
+            self._profile_speed_ = min(target_speed, self._profile_speed_ + step)
+        else:
+            self._profile_speed_ = max(target_speed, self._profile_speed_ - step)
+
+        return self._profile_speed_
 
     # ── ORIENT ──────────────────────────────────────────────────────────
     def _orient(self):

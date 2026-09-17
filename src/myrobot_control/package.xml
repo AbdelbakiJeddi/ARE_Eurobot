@@ -3,7 +3,7 @@
 <package format="3">
   <name>myrobot_control</name>
   <version>0.0.0</version>
-  <description>Motion control and navigation — GoToGoal action server/client and twist relay</description>
+  <description>Motion control and single-waypoint navigation</description>
   <maintainer email="jeddiabdelbaki3@gmail.com">abok</maintainer>
   <license>Apache 2.0</license>
 
@@ -13,7 +13,6 @@
   <exec_depend>rclpy</exec_depend>
   <depend>geometry_msgs</depend>
   <depend>nav_msgs</depend>
-  <exec_depend>myrobot_interfaces</exec_depend>
   <exec_depend>ros2launch</exec_depend>
 
   <test_depend>ament_lint_auto</test_depend>

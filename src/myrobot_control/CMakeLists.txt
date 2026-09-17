@@ -12,8 +12,6 @@ install(
 )
 
 install(PROGRAMS
-  ${PROJECT_NAME}/go_to_goal_server.py
-  ${PROJECT_NAME}/go_to_goal_client.py
   ${PROJECT_NAME}/twist_relay.py
   ${PROJECT_NAME}/simple_navigator.py
   DESTINATION lib/${PROJECT_NAME}

@@ -28,5 +28,7 @@ simple_navigator:
 
     # ── safety ───────────────────────────────────────────────────────────
     odom_timeout: 0.5    # s
-    max_state_time: 10.0 # s, stuck protection
+    max_state_time: 10.0 # s, ALIGN/ORIENT timeout
+    progress_timeout: 10.0 # s without measured drive progress
+    progress_epsilon: 0.01 # m required progress
     rate_hz: 20.0
